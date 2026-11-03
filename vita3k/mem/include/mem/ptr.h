@@ -41,7 +41,11 @@ public:
         if (pointer_bytes == 0) {
             addr = 0;
         } else {
+#ifdef VITA3K_NATIVE_CPU
+            addr = static_cast<Address>(reinterpret_cast<uintptr_t>(pointer_bytes)); // identity window
+#else
             addr = static_cast<Address>(pointer_bytes - &mem.memory[0]);
+#endif
         }
     }
 
@@ -57,6 +61,11 @@ public:
     T *get(const MemState &mem) const {
         if (addr == 0) {
             return nullptr;
+#ifdef VITA3K_NATIVE_CPU
+        } else if (true) {
+            // identity window: guest address == host address (the base is 0, no pointer arithmetic on null)
+            return reinterpret_cast<T *>(static_cast<uintptr_t>(addr));
+#endif
         } else if (mem.use_page_table) {
             return reinterpret_cast<T *>(mem.page_table[addr / KiB(4)] + addr);
         } else {
@@ -68,8 +77,12 @@ public:
     bool atomic_compare_and_swap(MemState &mem, U value, U expected) {
         static_assert(std::is_arithmetic_v<U>);
         static_assert(std::is_same_v<U, T>);
+#ifdef VITA3K_NATIVE_CPU
+        const auto ptr = reinterpret_cast<volatile U *>(static_cast<uintptr_t>(addr));
+#else
         uint8_t *mem_ptr = mem.use_page_table ? mem.page_table[addr / KiB(4)] : mem.memory.get();
         const auto ptr = reinterpret_cast<volatile U *>(&mem_ptr[addr]);
+#endif
         return ::atomic_compare_and_swap(ptr, value, expected);
     }
 

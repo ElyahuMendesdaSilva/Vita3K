@@ -37,8 +37,44 @@
 #endif
 
 constexpr uint32_t STANDARD_PAGE_SIZE = KiB(4);
+#ifdef VITA3K_NATIVE_CPU
+// Native CPU backend: guest address == host address ("identity window"). Only the window
+// [NATIVE_GUEST_BASE, NATIVE_GUEST_END) is mapped and usable. These must match native_cpu.h.
+#ifndef NATIVE_GUEST_BASE
+#define NATIVE_GUEST_BASE 0x80000000u
+#endif
+#ifndef NATIVE_GUEST_END
+#define NATIVE_GUEST_END 0xC0000000u
+#endif
+constexpr uint32_t NATIVE_WINDOW_START = NATIVE_GUEST_BASE;
+constexpr uint32_t NATIVE_WINDOW_END = NATIVE_GUEST_END;
+constexpr uint32_t NATIVE_WINDOW_SIZE = NATIVE_WINDOW_END - NATIVE_WINDOW_START;
+static_assert(NATIVE_WINDOW_START % KiB(4) == 0 && NATIVE_WINDOW_END % KiB(4) == 0);
+// Logical guest address space. It does not fit in a 32-bit size_t (GiB(4) would silently be 0 there).
+constexpr uint64_t TOTAL_MEM_SIZE = 0x1'0000'0000ULL;
+#else
 constexpr size_t TOTAL_MEM_SIZE = GiB(4);
+#endif
 constexpr bool LOG_PROTECT = false;
+
+// Host address of a guest address in the original (non page table) mapping
+static inline uint8_t *host_ptr(const MemState &state, Address addr) {
+#ifdef VITA3K_NATIVE_CPU
+    return reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(addr));
+#else
+    return &state.memory[addr];
+#endif
+}
+
+// Host address used to access a guest address (follows the page table when it is enabled)
+static inline uint8_t *translate_ptr(const MemState &state, Address addr) {
+#ifdef VITA3K_NATIVE_CPU
+    return reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(addr));
+#else
+    uint8_t *const base = state.use_page_table ? state.page_table[addr / KiB(4)] : state.memory.get();
+    return &base[addr];
+#endif
+}
 #ifdef NDEBUG
 constexpr bool PAGE_NAME_TRACKING = false;
 #else
@@ -75,6 +111,41 @@ bool init(MemState &state, const bool use_page_table) {
 
     state.invalid_access_logged.clear();
 
+#ifdef VITA3K_NATIVE_CPU
+    // Identity window: map exactly [NATIVE_WINDOW_START, NATIVE_WINDOW_END) at its own address.
+    // state.memory stays null (base 0), so a guest address is a host address.
+    void *const window_addr = reinterpret_cast<void *>(static_cast<uintptr_t>(NATIVE_WINDOW_START));
+    void *const window = mmap(window_addr, NATIVE_WINDOW_SIZE, PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (window != window_addr) {
+        // an old kernel ignores MAP_FIXED_NOREPLACE and treats it as a hint
+        if (window != MAP_FAILED)
+            munmap(window, NATIVE_WINDOW_SIZE);
+        LOG_CRITICAL("Cannot map the guest window at 0x{:X}: {}", NATIVE_WINDOW_START, get_error_msg());
+        return false;
+    }
+    state.memory = Memory(nullptr, delete_memory);
+
+    // Pages below the window are unusable: mark them allocated so the allocator never hands them out.
+    // Pages at or above the window end do not exist (maximum below).
+    const size_t table_length = NATIVE_WINDOW_END / STANDARD_PAGE_SIZE;
+    state.alloc_table = AllocPageTable(new AllocMemPage[table_length]);
+    memset(state.alloc_table.get(), 0, sizeof(AllocMemPage) * table_length);
+
+    state.allocator.set_maximum(table_length);
+    state.allocator.allocate_at(0, NATIVE_WINDOW_START / STANDARD_PAGE_SIZE);
+
+    const auto handler = [&state](uint8_t *addr, bool write) noexcept {
+        return handle_access_violation(state, addr, write);
+    };
+    register_access_violation_handler(handler);
+
+    // The page table maps guest addresses to other host buffers, which an identity mapping cannot do
+    if (use_page_table)
+        LOG_WARN("The page table is not supported by the native CPU backend, ignoring it");
+    state.use_page_table = false;
+    return true;
+#else
     void *preferred_address = reinterpret_cast<void *>(1ULL << 34);
 
 #ifdef _WIN32
@@ -132,6 +203,7 @@ bool init(MemState &state, const bool use_page_table) {
     }
 
     return true;
+#endif // VITA3K_NATIVE_CPU
 }
 
 static void delete_memory(uint8_t *memory) {
@@ -139,18 +211,26 @@ static void delete_memory(uint8_t *memory) {
 #ifdef _WIN32
         const BOOL ret = VirtualFree(memory, 0, MEM_RELEASE);
         assert(ret);
-#else
+#elif !defined(VITA3K_NATIVE_CPU)
         munmap(memory, TOTAL_MEM_SIZE);
 #endif
     }
 }
 
 bool is_valid_addr(const MemState &state, Address addr) {
+#ifdef VITA3K_NATIVE_CPU
+    if (addr < NATIVE_WINDOW_START || addr >= NATIVE_WINDOW_END)
+        return false;
+#endif
     const uint32_t page_num = addr / STANDARD_PAGE_SIZE;
     return addr && state.allocator.free_slot_count(page_num, page_num + 1) == 0;
 }
 
 bool is_valid_addr_range(const MemState &state, Address start, Address end) {
+#ifdef VITA3K_NATIVE_CPU
+    if (start < NATIVE_WINDOW_START || end > NATIVE_WINDOW_END || start >= end)
+        return false;
+#endif
     const uint32_t start_page = start / STANDARD_PAGE_SIZE;
     const uint32_t end_page = (end + STANDARD_PAGE_SIZE - 1) / STANDARD_PAGE_SIZE;
     return state.allocator.free_slot_count(start_page, end_page) == 0;
@@ -175,7 +255,7 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
     const Address commit_start = align_down(addr, state.host_page_size);
     const Address commit_end = align(addr + size, state.host_page_size);
     const uint32_t commit_size = commit_end - commit_start;
-    uint8_t *const commit_ptr = &state.memory[commit_start];
+    uint8_t *const commit_ptr = host_ptr(state, commit_start);
 
     // Make memory chunk available to access
 #ifdef _WIN32
@@ -185,7 +265,7 @@ static Address alloc_inner(MemState &state, uint32_t start_page, uint32_t page_c
     const int ret = mprotect(commit_ptr, commit_size, PROT_READ | PROT_WRITE);
     LOG_CRITICAL_IF(ret == -1, "mprotect failed: {}", get_error_msg());
 #endif
-    std::memset(&state.memory[addr], 0, size);
+    std::memset(host_ptr(state, addr), 0, size);
 
     AllocMemPage &page = state.alloc_table[page_num];
     assert(!page.allocated);
@@ -233,9 +313,7 @@ void unprotect_inner(MemState &state, Address addr, uint32_t size) {
     if (LOG_PROTECT) {
         fmt::print("Unprotect: {} {}\n", log_hex(addr), size);
     }
-    uint8_t *addr_ptr = state.use_page_table ? state.page_table[addr / KiB(4)] : state.memory.get();
-
-    uint8_t *target = &addr_ptr[addr];
+    uint8_t *target = translate_ptr(state, addr);
     uint8_t *aligned_start = reinterpret_cast<uint8_t *>(
         align_down(reinterpret_cast<uintptr_t>(target), state.host_page_size));
     uint8_t *aligned_end = reinterpret_cast<uint8_t *>(align(reinterpret_cast<uintptr_t>(target + size), state.host_page_size));
@@ -252,9 +330,7 @@ void unprotect_inner(MemState &state, Address addr, uint32_t size) {
 }
 
 void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm perm) {
-    uint8_t *addr_ptr = state.use_page_table ? state.page_table[addr / KiB(4)] : state.memory.get();
-
-    uint8_t *target = &addr_ptr[addr];
+    uint8_t *target = translate_ptr(state, addr);
     uint8_t *aligned_start = reinterpret_cast<uint8_t *>(
         align_down(reinterpret_cast<uintptr_t>(target), state.host_page_size));
     uint8_t *aligned_end = reinterpret_cast<uint8_t *>(align(reinterpret_cast<uintptr_t>(target + size), state.host_page_size));
@@ -271,15 +347,21 @@ void protect_inner(MemState &state, Address addr, uint32_t size, const MemPerm p
 }
 
 bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcept {
-    const uintptr_t memory_addr = reinterpret_cast<uintptr_t>(state.memory.get());
     const uintptr_t fault_addr = reinterpret_cast<uintptr_t>(addr);
 
     Address vaddr = 0;
     const std::unique_lock<std::mutex> lock(state.protect_mutex);
+#ifdef VITA3K_NATIVE_CPU
+    // identity window: the fault address is the guest address
+    if (fault_addr < NATIVE_WINDOW_START || fault_addr >= NATIVE_WINDOW_END)
+        return false;
+    vaddr = static_cast<Address>(fault_addr);
+#else
+    const uintptr_t memory_addr = reinterpret_cast<uintptr_t>(state.memory.get());
     if (fault_addr < memory_addr || fault_addr >= memory_addr + TOTAL_MEM_SIZE) {
         if (state.use_page_table) {
             // this may come from an external mapping
-            uint64_t addr_val = std::bit_cast<uint64_t>(addr);
+            uint64_t addr_val = static_cast<uint64_t>(fault_addr);
             auto it = state.external_mapping.lower_bound(addr_val);
             if (it != state.external_mapping.end() && addr_val < it->first + it->second.size) {
                 vaddr = static_cast<Address>(addr_val - it->first + it->second.address);
@@ -292,6 +374,7 @@ bool handle_access_violation(MemState &state, uint8_t *addr, bool write) noexcep
     } else {
         vaddr = static_cast<Address>(fault_addr - memory_addr);
     }
+#endif
 
     if (!is_valid_addr(state, vaddr)) {
         return false;
@@ -387,9 +470,9 @@ void add_external_mapping(MemState &mem, Address addr, uint32_t size, uint8_t *a
     if (!mem.use_page_table)
         return;
 
-    uint64_t addr_value = std::bit_cast<uint64_t>(addr_ptr);
+    uint64_t addr_value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(addr_ptr));
     uint8_t *page_table_entry = addr_ptr - addr;
-    uint8_t *original_address = &mem.memory[addr];
+    uint8_t *original_address = host_ptr(mem, addr);
     for (int block = 0; block < size / KiB(4); block++) {
         // this is not thread write safe, but hopefully not other thread is busy copying while this happens
         memcpy(addr_ptr + block * KiB(4), original_address + block * KiB(4), KiB(4));
@@ -406,7 +489,7 @@ void add_external_mapping(MemState &mem, Address addr, uint32_t size, uint8_t *a
 }
 
 void remove_external_mapping(MemState &mem, uint8_t *addr_ptr, uint32_t size) {
-    uint64_t addr_value = std::bit_cast<uint64_t>(addr_ptr);
+    uint64_t addr_value = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(addr_ptr));
     MemExternalMapping mapping;
     if (mem.use_page_table) {
         const std::unique_lock<std::mutex> lock(mem.protect_mutex);
@@ -416,7 +499,11 @@ void remove_external_mapping(MemState &mem, uint8_t *addr_ptr, uint32_t size) {
         mapping = it->second;
         mem.external_mapping.erase(it);
     } else {
+#ifdef VITA3K_NATIVE_CPU
+        mapping.address = static_cast<Address>(reinterpret_cast<uintptr_t>(addr_ptr));
+#else
         mapping.address = static_cast<Address>(addr_ptr - mem.memory.get());
+#endif
         mapping.size = size;
     }
 
@@ -449,7 +536,7 @@ void remove_external_mapping(MemState &mem, uint8_t *addr_ptr, uint32_t size) {
         // copy back and reset the page table
         for (int block = 0; block < mapping.size / KiB(4); block++) {
             // this is not thread write safe, but hopefully not other thread is busy copying while this happens
-            memcpy(&mem.memory[mapping.address] + block * KiB(4), addr_ptr + block * KiB(4), KiB(4));
+            memcpy(host_ptr(mem, mapping.address) + block * KiB(4), addr_ptr + block * KiB(4), KiB(4));
             mem.page_table[mapping.address / KiB(4) + block] = mem.memory.get();
         }
     }
@@ -518,7 +605,7 @@ void free(MemState &state, Address address) {
                 batch_start = host_page;
             batch_size += state.host_page_size;
         } else if (batch_size > 0) {
-            uint8_t *memory = &state.memory[batch_start];
+            uint8_t *memory = host_ptr(state, batch_start);
 #ifdef _WIN32
             const BOOL ret = VirtualFree(memory, batch_size, MEM_DECOMMIT);
             LOG_CRITICAL_IF(!ret, "VirtualFree failed: {}", get_error_msg());
@@ -534,7 +621,7 @@ void free(MemState &state, Address address) {
     }
 
     if (batch_size > 0) {
-        uint8_t *memory = &state.memory[batch_start];
+        uint8_t *memory = host_ptr(state, batch_start);
 #ifdef _WIN32
         const BOOL ret = VirtualFree(memory, batch_size, MEM_DECOMMIT);
         LOG_CRITICAL_IF(!ret, "VirtualFree failed: {}", get_error_msg());
@@ -566,6 +653,9 @@ void deinit_mem(MemState &state) {
         state.protect_tree.clear();
     }
 
+#ifdef VITA3K_NATIVE_CPU
+    munmap(reinterpret_cast<void *>(static_cast<uintptr_t>(NATIVE_WINDOW_START)), NATIVE_WINDOW_SIZE);
+#endif
     state.memory.reset();
     state.alloc_table.reset();
     state.allocator.reset();
