@@ -3,7 +3,19 @@
 
 #include <fmt/format.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <string>
+#include <type_traits>
+
+// Vita3K's log_hex(): formats a number (or pointer) as 0x... in log messages
+template <typename T>
+inline std::string log_hex(T value) {
+    if constexpr (std::is_pointer_v<T>)
+        return fmt::format("0x{:x}", static_cast<uint64_t>(reinterpret_cast<uintptr_t>(value)));
+    else
+        return fmt::format("0x{:x}", static_cast<uint64_t>(value));
+}
 
 #define NH_LOG(level, ...)                                                    \
     do {                                                                      \
