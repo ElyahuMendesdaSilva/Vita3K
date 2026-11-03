@@ -1,0 +1,58 @@
+name: native-harness
+
+# Builds only the NativeCPU harness (armeabi-v7a) with the NDK, not the whole emulator.
+# Download the artifact, then on the phone:
+#   adb push native_harness /data/local/tmp/ && adb shell /data/local/tmp/native_harness
+# Expected output: PASS: r0=50 imports=1 nid=0x1234
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "native-harness/**"
+      - "vita3k/cpu/**"
+      - "vita3k/mem/**"
+      - ".github/workflows/native-harness.yml"
+
+env:
+  NDK_VERSION: 29.0.14206865
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only the two submodules the harness needs, not the whole Vita3K tree
+      - name: Fetch fmt and capstone
+        run: git submodule update --init --depth 1 external/fmt external/capstone
+
+      - name: Install NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;${NDK_VERSION}" >/dev/null
+          echo "NDK=$ANDROID_HOME/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          cmake -S native-harness -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build --target native_harness -v 2>&1 | tee build.log
+
+      - name: Upload binary
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native_harness-armeabi-v7a
+          path: build/native_harness
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
