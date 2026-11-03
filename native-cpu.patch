@@ -1,0 +1,711 @@
+diff -ruN a/vita3k/cpu/CMakeLists.txt b/vita3k/cpu/CMakeLists.txt
+--- a/vita3k/cpu/CMakeLists.txt	2026-11-03 02:23:16.113256615 +0000
++++ b/vita3k/cpu/CMakeLists.txt	2026-11-03 02:23:38.943982819 +0000
+@@ -1,15 +1,28 @@
+ set(SOURCE_LIST
+ include/cpu/state.h
+ include/cpu/common.h
+-include/cpu/impl/dynarmic_cpu.h
+ include/cpu/disasm/functions.h
+ include/cpu/disasm/state.h
+ 
+ src/disasm.cpp
+ src/cpu.cpp
+-src/dynarmic_cpu.cpp
+ )
+ 
++# Native AArch32 backend: only for 32-bit ARM hosts (armeabi-v7a), replaces Dynarmic
++if(VITA3K_NATIVE_CPU)
++    enable_language(ASM)
++    list(APPEND SOURCE_LIST
++        include/cpu/impl/native_cpu.h
++        src/native_cpu.cpp
++        src/native_enter_arm.S
++    )
++else()
++    list(APPEND SOURCE_LIST
++        include/cpu/impl/dynarmic_cpu.h
++        src/dynarmic_cpu.cpp
++    )
++endif()
++
+ add_library(
+ cpu
+ STATIC
+@@ -20,4 +33,13 @@
+ 
+ target_include_directories(cpu PUBLIC include)
+ target_link_libraries(cpu PUBLIC mem util)
+-target_link_libraries(cpu PRIVATE dynarmic capstone merry::mcl)
++if(VITA3K_NATIVE_CPU)
++    target_compile_definitions(cpu PUBLIC VITA3K_NATIVE_CPU=1)
++    target_link_libraries(cpu PRIVATE capstone merry::mcl)
++
++    # M1 harness: hand-assembled guest code through NativeCPU, no emulator needed
++    add_executable(native_harness tests/native_harness.cpp)
++    target_link_libraries(native_harness PRIVATE cpu)
++else()
++    target_link_libraries(cpu PRIVATE dynarmic capstone merry::mcl)
++endif()
+diff -ruN a/vita3k/cpu/include/cpu/impl/native_cpu.h b/vita3k/cpu/include/cpu/impl/native_cpu.h
+--- a/vita3k/cpu/include/cpu/impl/native_cpu.h	1970-01-01 00:00:00.000000000 +0000
++++ b/vita3k/cpu/include/cpu/impl/native_cpu.h	2026-11-03 02:23:38.944165999 +0000
+@@ -0,0 +1,111 @@
++// Vita3K emulator project - native AArch32 CPU backend (experimental, M1)
++// GPL-2.0-or-later, same as Vita3K.
++//
++// Runs the guest's ARMv7 code directly on a 32-bit ARM host. Guest address == host address
++// (identity window), so this only works once MemState maps guest memory at its own addresses.
++#pragma once
++
++#if defined(__arm__)
++
++#include <cpu/state.h>
++
++#include <atomic>
++#include <csignal>
++#include <ucontext.h>
++#include <cstddef>
++#include <cstdint>
++#include <pthread.h>
++
++// Guest window that must be mapped 1:1 in the host (see mem/ changes). Faults and traps are
++// only treated as guest events when the interrupted PC is inside it.
++#ifndef NATIVE_GUEST_BASE
++#define NATIVE_GUEST_BASE 0x80000000u
++#endif
++#ifndef NATIVE_GUEST_END
++#define NATIVE_GUEST_END 0xC0000000u
++#endif
++#ifndef NATIVE_STOP_SIGNAL
++#define NATIVE_STOP_SIGNAL SIGUSR2
++#endif
++
++// ARM `udf #0`. Replaces the guest import stub's `svc #0` (a real svc would be a Linux syscall).
++inline constexpr uint32_t NATIVE_IMPORT_UDF = 0xe7f000f0;
++// Thumb `udf #0`, used as the halt instruction the guest returns to (return_pc).
++inline constexpr uint16_t NATIVE_HALT_UDF_THUMB = 0xde00;
++
++// Layout shared with native_enter_arm.S. Do not reorder.
++struct alignas(8) NativeCtx {
++    uint32_t r[16]; // 0: r0-r12, sp, lr, pc (pc without the Thumb bit)
++    uint32_t cpsr; // 64
++    uint32_t fpscr; // 68
++    uint32_t tls_hw; // 72: value written to the real TPIDRURW on entry
++    uint32_t reserved; // 76
++    uint32_t s[64]; // 80: s0-s63 == d0-d31
++};
++static_assert(offsetof(NativeCtx, cpsr) == 64 && offsetof(NativeCtx, fpscr) == 68);
++static_assert(offsetof(NativeCtx, tls_hw) == 72 && offsetof(NativeCtx, s) == 80);
++
++struct NativeHost {
++    uint32_t sp = 0; // host sp after native_enter's pushes, where native_leave resumes
++};
++
++enum NativeExit : uint32_t {
++    NATIVE_EXIT_IMPORT = 1,
++    NATIVE_EXIT_RETURNED = 2,
++    NATIVE_EXIT_FAULT = 3,
++    NATIVE_EXIT_STOPPED = 4,
++    NATIVE_EXIT_UNDEFINED = 5,
++};
++
++extern "C" uint32_t native_enter(NativeCtx *ctx, NativeHost *host);
++extern "C" void native_leave();
++
++class NativeCPU : public CPUState {
++    friend struct NativeSignals;
++
++    NativeCtx ctx_{};
++    NativeHost host_{};
++    uint32_t tpidruro_ = 0;
++    uint32_t tpidrurw_ = 0;
++
++    std::atomic<bool> in_guest_{ false };
++    std::atomic<bool> stop_requested_{ false };
++    std::atomic<pthread_t> tid_{};
++    uint32_t pending_nid_ = 0;
++    bool unhandled_fault_ = false;
++    uint32_t last_fault_pc_ = 0;
++    int fault_repeat_ = 0;
++    bool log_mem_ = false;
++
++    uint32_t run_guest();
++    void capture(ucontext_t *uc);
++
++public:
++    NativeCPU(MemState &mem, SceUID thread_id, std::size_t processor_id);
++    ~NativeCPU() override;
++
++    std::optional<uint32_t> execute(GuestBoundary &boundary, bool from_kernel_call) override;
++    void request_stop() override;
++
++    uint32_t get_reg(uint8_t idx) override;
++    void set_reg(uint8_t idx, uint32_t val) override;
++    uint32_t get_cpsr() override;
++    void set_cpsr(uint32_t val) override;
++    uint32_t get_tpidruro() override;
++    void set_tpidruro(uint32_t val) override;
++    uint32_t get_tpidrurw() override;
++    void set_tpidrurw(uint32_t val) override;
++    float get_float_reg(uint8_t idx) override;
++    void set_float_reg(uint8_t idx, float val) override;
++    uint32_t get_fpscr() override;
++    void set_fpscr(uint32_t val) override;
++    CPUContext save_context() override;
++    void load_context(const CPUContext &ctx) override;
++    void invalidate_jit_cache(Address start, size_t length) override;
++    bool hit_breakpoint() override;
++    void set_log_code(bool log) override;
++    void set_log_mem(bool log) override;
++    bool get_log_mem() override;
++};
++
++#endif // __arm__
+diff -ruN a/vita3k/cpu/src/cpu.cpp b/vita3k/cpu/src/cpu.cpp
+--- a/vita3k/cpu/src/cpu.cpp	2026-11-03 02:23:16.113313956 +0000
++++ b/vita3k/cpu/src/cpu.cpp	2026-11-03 02:23:38.944043323 +0000
+@@ -16,7 +16,11 @@
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
+ #include <cpu/disasm/functions.h>
++#ifdef VITA3K_NATIVE_CPU
++#include <cpu/impl/native_cpu.h>
++#else
+ #include <cpu/impl/dynarmic_cpu.h>
++#endif
+ #include <cpu/state.h>
+ #include <mem/ptr.h>
+ #include <util/types.h>
+@@ -31,7 +35,11 @@
+     , processor_id(processor_id) {}
+ 
+ CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem) {
++#ifdef VITA3K_NATIVE_CPU
++    CPUStatePtr cpu = std::make_unique<NativeCPU>(mem, thread_id, processor_id);
++#else
+     CPUStatePtr cpu = std::make_unique<DynarmicCPU>(mem, thread_id, processor_id, cpu_opt);
++#endif
+     if (!init(cpu->disasm))
+         return nullptr;
+     return cpu;
+diff -ruN a/vita3k/cpu/src/native_cpu.cpp b/vita3k/cpu/src/native_cpu.cpp
+--- a/vita3k/cpu/src/native_cpu.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/vita3k/cpu/src/native_cpu.cpp	2026-11-03 02:23:38.944066135 +0000
+@@ -0,0 +1,323 @@
++// Vita3K emulator project - native AArch32 CPU backend (experimental, M1)
++// GPL-2.0-or-later, same as Vita3K.
++
++#if defined(__arm__)
++
++#include <cpu/impl/native_cpu.h>
++
++#include <mem/functions.h>
++#include <mem/ptr.h>
++#include <util/log.h>
++
++#include <sys/mman.h>
++#include <ucontext.h>
++
++#include <bit>
++#include <cstring>
++#include <mutex>
++
++// ITSTATE bits of the CPSR. They cannot be restored from user mode, so guest code is only
++// stopped or resumed outside IT blocks.
++static constexpr uint32_t CPSR_IT_MASK = 0x0600FC00u;
++static constexpr uint32_t CPSR_THUMB = 0x20u;
++
++// bionic's ucontext_t for ARM exposes the extra register state (VFP) as uc_regspace.
++// VERIFY in <sys/ucontext.h> of the NDK in use; adapt this macro if the name differs.
++#define NATIVE_UC_REGSPACE(uc) (reinterpret_cast<uint8_t *>((uc)->uc_regspace))
++
++struct NativeAuxHead {
++    uint32_t magic;
++    uint32_t size;
++};
++static constexpr uint32_t VFP_MAGIC = 0x56465001;
++struct NativeVfpFrame {
++    NativeAuxHead head;
++    uint64_t fpregs[32];
++    uint32_t fpscr;
++};
++
++static bool in_guest_window(uintptr_t pc) {
++    return pc >= NATIVE_GUEST_BASE && pc < NATIVE_GUEST_END;
++}
++
++// ---------------------------------------------------------------------------------------------
++// Signal handling. One mechanism ends every guest run: imports, return to the halt instruction,
++// faults and stop requests all arrive as signals while the PC is inside the guest window, the
++// handler captures the guest state and redirects the context to native_leave.
++
++struct NativeSignals {
++    static struct sigaction old_segv, old_bus, old_ill;
++
++    static void capture_vfp(ucontext_t *uc, NativeCtx &ctx) {
++        uint8_t *p = NATIVE_UC_REGSPACE(uc);
++        for (;;) {
++            const auto *head = reinterpret_cast<const NativeAuxHead *>(p);
++            if (head->magic == VFP_MAGIC) {
++                const auto *vfp = reinterpret_cast<const NativeVfpFrame *>(p);
++                std::memcpy(ctx.s, vfp->fpregs, sizeof(ctx.s));
++                ctx.fpscr = vfp->fpscr;
++                return;
++            }
++            if (head->magic == 0 || head->size == 0)
++                return;
++            p += head->size;
++        }
++    }
++
++    static void leave(ucontext_t *uc, NativeCPU &cpu, NativeExit why) {
++        cpu.capture(uc);
++        cpu.in_guest_.store(false, std::memory_order_release);
++        auto &m = uc->uc_mcontext;
++        m.arm_pc = reinterpret_cast<uintptr_t>(&native_leave);
++        m.arm_sp = cpu.host_.sp;
++        m.arm_r0 = why;
++        m.arm_cpsr &= ~(CPSR_THUMB | CPSR_IT_MASK); // native_leave is ARM code
++    }
++
++    static void chain(const struct sigaction &old, int sig, siginfo_t *si, void *uc) {
++        if (old.sa_flags & SA_SIGINFO) {
++            if (old.sa_sigaction)
++                old.sa_sigaction(sig, si, uc);
++        } else if (old.sa_handler != SIG_DFL && old.sa_handler != SIG_IGN && old.sa_handler) {
++            old.sa_handler(sig);
++        } else {
++            signal(sig, SIG_DFL);
++            raise(sig);
++        }
++    }
++
++    static void handler(int sig, siginfo_t *si, void *uct) {
++        auto *uc = static_cast<ucontext_t *>(uct);
++        auto &m = uc->uc_mcontext;
++        // The thread's CPU, set by ThreadState::run_loop. Only NativeCPU exists in this build.
++        auto *cpu = static_cast<NativeCPU *>(get_current_cpu_state());
++        const bool guest_pc = cpu && cpu->in_guest_.load(std::memory_order_acquire) && in_guest_window(m.arm_pc);
++
++        if (sig == NATIVE_STOP_SIGNAL) {
++            // Outside the guest (or inside an IT block) the request stays pending: the loop reaches
++            // a checkpoint on its own at the next import.
++            if (guest_pc && !(m.arm_cpsr & CPSR_IT_MASK))
++                leave(uc, *cpu, NATIVE_EXIT_STOPPED);
++            return;
++        }
++
++        if (!guest_pc) {
++            chain(sig == SIGILL ? old_ill : sig == SIGBUS ? old_bus
++                                                          : old_segv,
++                sig, si, uct);
++            return;
++        }
++
++        if (sig == SIGILL) {
++            const bool thumb = m.arm_cpsr & CPSR_THUMB;
++            if ((m.arm_pc & ~1u) == (cpu->return_pc & ~1u)) {
++                leave(uc, *cpu, NATIVE_EXIT_RETURNED);
++            } else if (!thumb && *reinterpret_cast<const uint32_t *>(m.arm_pc) == NATIVE_IMPORT_UDF) {
++                // Stub layout: udf; mov pc, lr; .word nid
++                cpu->pending_nid_ = *reinterpret_cast<const uint32_t *>(m.arm_pc + 8);
++                // capture() stores arm_pc, so move it past the udf first: the guest resumes at
++                // the `mov pc, lr`, like the Dynarmic backend does after CallSVC.
++                m.arm_pc += 4;
++                leave(uc, *cpu, NATIVE_EXIT_IMPORT);
++            } else {
++                leave(uc, *cpu, NATIVE_EXIT_UNDEFINED);
++            }
++            return;
++        }
++
++        // SIGSEGV / SIGBUS inside guest code
++        const uintptr_t addr = reinterpret_cast<uintptr_t>(si->si_addr);
++        // VERIFY on device: on an arm64 kernel (compat task) error_code carries the ESR, whose
++        // bit 6 is WnR; on a native arm32 kernel it is the FSR, whose bit 11 is WnR.
++        const bool write = m.error_code & (1u << 6);
++        if (handle_access_violation(cpu->mem, reinterpret_cast<uint8_t *>(addr), write)) {
++            // A protect callback (kubridge) may have noted an abort: tell the thread. Otherwise
++            // the page is unprotected now and the instruction is retried.
++            if (cpu->abort_pending.load())
++                leave(uc, *cpu, NATIVE_EXIT_FAULT);
++            return;
++        }
++        cpu->unhandled_fault_ = true;
++        cpu->abort_fault_addr.store(static_cast<uint32_t>(addr));
++        cpu->abort_pending.store(true);
++        leave(uc, *cpu, NATIVE_EXIT_FAULT);
++    }
++
++    static void install() {
++        static std::once_flag once;
++        std::call_once(once, [] {
++            struct sigaction sa {};
++            sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
++            sa.sa_sigaction = &handler;
++            sigemptyset(&sa.sa_mask);
++            sigaddset(&sa.sa_mask, NATIVE_STOP_SIGNAL);
++            sigaction(SIGSEGV, &sa, &old_segv);
++            sigaction(SIGBUS, &sa, &old_bus);
++            sigaction(SIGILL, &sa, &old_ill);
++            sigaction(NATIVE_STOP_SIGNAL, &sa, nullptr);
++        });
++    }
++
++    // Per host thread: an alternate stack (the guest stack must not host signal frames) and the
++    // stop signal unblocked.
++    static void prepare_thread() {
++        static thread_local bool ready = false;
++        if (ready)
++            return;
++        constexpr size_t size = 64 * 1024;
++        void *stack = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (stack != MAP_FAILED) {
++            stack_t ss{};
++            ss.ss_sp = stack;
++            ss.ss_size = size;
++            sigaltstack(&ss, nullptr);
++        }
++        sigset_t set;
++        sigemptyset(&set);
++        sigaddset(&set, NATIVE_STOP_SIGNAL);
++        pthread_sigmask(SIG_UNBLOCK, &set, nullptr);
++        ready = true;
++    }
++};
++struct sigaction NativeSignals::old_segv;
++struct sigaction NativeSignals::old_bus;
++struct sigaction NativeSignals::old_ill;
++
++void NativeCPU::capture(ucontext_t *uc) {
++    const auto &m = uc->uc_mcontext;
++    const unsigned long regs[16] = { m.arm_r0, m.arm_r1, m.arm_r2, m.arm_r3, m.arm_r4, m.arm_r5, m.arm_r6, m.arm_r7,
++        m.arm_r8, m.arm_r9, m.arm_r10, m.arm_fp, m.arm_ip, m.arm_sp, m.arm_lr, m.arm_pc };
++    for (int i = 0; i < 16; i++)
++        ctx_.r[i] = static_cast<uint32_t>(regs[i]);
++    ctx_.cpsr = static_cast<uint32_t>(m.arm_cpsr);
++    NativeSignals::capture_vfp(uc, ctx_);
++}
++
++// ---------------------------------------------------------------------------------------------
++
++NativeCPU::NativeCPU(MemState &mem, SceUID thread_id, std::size_t processor_id)
++    : CPUState(mem, thread_id, processor_id) {
++    ctx_.cpsr = 0x10; // user mode, ARM state
++}
++
++NativeCPU::~NativeCPU() = default;
++
++uint32_t NativeCPU::run_guest() {
++    NativeSignals::install();
++    NativeSignals::prepare_thread();
++    tid_.store(pthread_self());
++
++    ctx_.cpsr &= ~CPSR_IT_MASK;
++    ctx_.tls_hw = tpidruro_; // M0 trick: the guest's `mrc c13,c0,3` is patched to read c13,c0,2
++    in_guest_.store(true, std::memory_order_release);
++    // A request that arrived before in_guest_ was visible would otherwise be lost
++    if (stop_requested_.exchange(false)) {
++        in_guest_.store(false, std::memory_order_release);
++        return NATIVE_EXIT_STOPPED;
++    }
++    const uint32_t why = native_enter(&ctx_, &host_);
++    in_guest_.store(false, std::memory_order_release);
++    return why;
++}
++
++std::optional<uint32_t> NativeCPU::execute(GuestBoundary &boundary, bool from_kernel_call) {
++    GuestResume resume = boundary.checkpoint({ .after_kernel_call = from_kernel_call });
++    while (resume != GuestResume::leave) {
++        // GuestResume::step is not supported by this backend: it runs instead
++        unhandled_fault_ = false;
++        const NativeExit why = static_cast<NativeExit>(run_guest());
++
++        bool kernel_call = false;
++        bool returned = false;
++        switch (why) {
++        case NATIVE_EXIT_IMPORT:
++            kernel_call = true;
++            boundary.call_import(pending_nid_);
++            break;
++        case NATIVE_EXIT_RETURNED:
++            returned = true;
++            break;
++        case NATIVE_EXIT_UNDEFINED:
++            LOG_CRITICAL("Undefined instruction at 0x{:x} (thread {})\n{}", ctx_.r[15], thread_id, save_context().description());
++            returned = true; // like a NoExecuteFault in the Dynarmic backend: the thread stops
++            break;
++        case NATIVE_EXIT_FAULT:
++            if (unhandled_fault_) {
++                // No guest handler can fix this access. Dynarmic logs it and goes on with 0 or a
++                // dropped write; here the instruction would fault forever, so a repeated fault at
++                // the same PC ends the thread.
++                LOG_ERROR("Invalid access at 0x{:x} by thread {} (pc 0x{:x})", abort_fault_addr.load(), thread_id, ctx_.r[15]);
++                fault_repeat_ = (ctx_.r[15] == last_fault_pc_) ? fault_repeat_ + 1 : 0;
++                last_fault_pc_ = ctx_.r[15];
++            }
++            break;
++        case NATIVE_EXIT_STOPPED:
++            break;
++        }
++
++        if (abort_pending.exchange(false))
++            boundary.dispatch_abort(abort_fault_addr.load());
++        if (fault_repeat_ >= 3) {
++            LOG_CRITICAL("Thread {} faults forever at 0x{:x}, stopping it", thread_id, last_fault_pc_);
++            fault_repeat_ = 0;
++            returned = true;
++        }
++
++        resume = boundary.checkpoint({ .after_kernel_call = kernel_call, .debugger_stop = false, .returned = returned });
++        if (returned)
++            return get_reg(0);
++    }
++    return std::nullopt;
++}
++
++void NativeCPU::request_stop() {
++    // Signal safe: an atomic, plus pthread_kill if the thread is running guest code
++    stop_requested_.store(true, std::memory_order_release);
++    if (in_guest_.load(std::memory_order_acquire))
++        pthread_kill(tid_.load(), NATIVE_STOP_SIGNAL);
++}
++
++uint32_t NativeCPU::get_reg(uint8_t idx) { return ctx_.r[idx]; }
++void NativeCPU::set_reg(uint8_t idx, uint32_t val) { ctx_.r[idx] = val; }
++uint32_t NativeCPU::get_cpsr() { return ctx_.cpsr; }
++void NativeCPU::set_cpsr(uint32_t val) { ctx_.cpsr = val; }
++uint32_t NativeCPU::get_tpidruro() { return tpidruro_; }
++void NativeCPU::set_tpidruro(uint32_t val) { tpidruro_ = val; }
++uint32_t NativeCPU::get_tpidrurw() { return tpidrurw_; }
++void NativeCPU::set_tpidrurw(uint32_t val) { tpidrurw_ = val; }
++float NativeCPU::get_float_reg(uint8_t idx) { return std::bit_cast<float>(ctx_.s[idx]); }
++void NativeCPU::set_float_reg(uint8_t idx, float val) { ctx_.s[idx] = std::bit_cast<uint32_t>(val); }
++uint32_t NativeCPU::get_fpscr() { return ctx_.fpscr; }
++void NativeCPU::set_fpscr(uint32_t val) { ctx_.fpscr = val; }
++
++CPUContext NativeCPU::save_context() {
++    CPUContext c;
++    std::memcpy(c.cpu_registers.data(), ctx_.r, sizeof(ctx_.r));
++    std::memcpy(c.fpu_registers.data(), ctx_.s, sizeof(ctx_.s));
++    c.cpsr = ctx_.cpsr;
++    c.fpscr = ctx_.fpscr;
++    return c;
++}
++
++void NativeCPU::load_context(const CPUContext &c) {
++    std::memcpy(ctx_.r, c.cpu_registers.data(), sizeof(ctx_.r));
++    std::memcpy(ctx_.s, c.fpu_registers.data(), sizeof(ctx_.s));
++    ctx_.cpsr = c.cpsr;
++    ctx_.fpscr = c.fpscr;
++}
++
++void NativeCPU::invalidate_jit_cache(Address start, size_t length) {
++    // Guest code is real code now: after loading, relocating or patching it, the I-cache must see it
++    char *const p = reinterpret_cast<char *>(Ptr<uint8_t>(start).get(mem));
++    __builtin___clear_cache(p, p + length);
++}
++
++bool NativeCPU::hit_breakpoint() { return false; }
++void NativeCPU::set_log_code(bool log) {
++    if (log)
++        LOG_WARN("Code tracing is not supported by the native CPU backend");
++}
++void NativeCPU::set_log_mem(bool log) { log_mem_ = log; }
++bool NativeCPU::get_log_mem() { return log_mem_; }
++
++#endif // __arm__
+diff -ruN a/vita3k/cpu/src/native_enter_arm.S b/vita3k/cpu/src/native_enter_arm.S
+--- a/vita3k/cpu/src/native_enter_arm.S	1970-01-01 00:00:00.000000000 +0000
++++ b/vita3k/cpu/src/native_enter_arm.S	2026-11-03 02:23:38.944054540 +0000
+@@ -0,0 +1,60 @@
++@ Vita3K native AArch32 backend: switch between host and guest.
++@
++@ uint32_t native_enter(NativeCtx *ctx /*r0*/, NativeHost *host /*r1*/)
++@   Saves the host's callee-saved state on the host stack, loads the whole guest state from ctx
++@   and jumps to the guest PC. It does not return by itself: the signal handler captures the guest
++@   state into ctx and redirects the interrupted context to native_leave, with sp = host->sp and
++@   r0 = NativeExit. native_leave then returns to native_enter's caller.
++@
++@ NativeCtx offsets: r[16]=0, cpsr=64, fpscr=68, tls_hw=72, s[64]=80.
++
++    .syntax unified
++    .arch   armv7-a
++    .fpu    neon
++    .arm
++    .text
++
++    .global native_enter
++    .type   native_enter, %function
++    .p2align 2
++native_enter:
++    push    {r4-r11, lr}
++    vpush   {d8-d15}
++    vmrs    r2, fpscr
++    push    {r2}                    @ host fpscr
++    str     sp, [r1]                @ host->sp
++    mov     r4, r0                  @ r4 = ctx
++
++    clrex
++    ldr     r0, [r4, #72]
++    mcr     p15, 0, r0, c13, c0, 2  @ real TPIDRURW (the guest's TLS, see notes)
++    ldr     r0, [r4, #68]
++    vmsr    fpscr, r0
++    add     r0, r4, #80
++    vldmia  r0!, {d0-d15}
++    vldmia  r0, {d16-d31}
++
++    ldr     r5, [r4, #60]           @ guest pc
++    ldr     r6, [r4, #64]           @ guest cpsr
++    tst     r6, #0x20               @ Thumb?
++    orrne   r5, r5, #1              @ bit 0 selects the state when loaded into pc
++    str     r5, [r4, #60]
++    msr     APSR_nzcvqg, r6         @ N Z C V Q GE; ITSTATE must be zero (caller guarantees)
++
++    add     sp, r4, #52             @ sp = &ctx.r[13]
++    ldm     r4, {r0-r12}            @ guest r0-r12 (r4 itself is overwritten last)
++    ldm     sp, {sp, lr, pc}        @ guest sp, lr and pc (interworking through bit 0)
++    .size   native_enter, . - native_enter
++
++@ Entered from the signal handler with sp = host->sp and r0 = NativeExit, in ARM state.
++    .global native_leave
++    .type   native_leave, %function
++    .p2align 2
++native_leave:
++    pop     {r2}
++    vmsr    fpscr, r2
++    vpop    {d8-d15}
++    pop     {r4-r11, pc}            @ back to native_enter's caller, r0 = reason
++    .size   native_leave, . - native_leave
++
++    .section .note.GNU-stack,"",%progbits
+diff -ruN a/vita3k/cpu/tests/native_harness.cpp b/vita3k/cpu/tests/native_harness.cpp
+--- a/vita3k/cpu/tests/native_harness.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/vita3k/cpu/tests/native_harness.cpp	2026-11-03 02:23:38.944255434 +0000
+@@ -0,0 +1,66 @@
++// M1 harness: runs hand-assembled ARM code through NativeCPU without the rest of Vita3K.
++// Needs a 32-bit ARM host (armeabi-v7a) and the free window at NATIVE_GUEST_BASE.
++#if defined(__arm__)
++#include <cpu/impl/native_cpu.h>
++#include <sys/mman.h>
++#include <cstdio>
++#include <cstring>
++
++struct FakeBoundary : GuestBoundary {
++    NativeCPU *cpu = nullptr;
++    uint32_t last_nid = 0;
++    int imports = 0;
++    GuestResume checkpoint(GuestStop stop) override {
++        return stop.returned ? GuestResume::leave : GuestResume::run;
++    }
++    void call_import(uint32_t nid) override {
++        last_nid = nid;
++        imports++;
++        cpu->set_reg(0, cpu->get_reg(0) * 10); // the "HLE function": r0 *= 10
++    }
++    void dispatch_abort(Address) override {}
++};
++
++int main() {
++    const uintptr_t W = NATIVE_GUEST_BASE;
++    void *p = mmap(reinterpret_cast<void *>(W), 0x10000, PROT_READ | PROT_WRITE | PROT_EXEC,
++        MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
++    if (p != reinterpret_cast<void *>(W)) {
++        std::puts("FAIL: cannot map the guest window");
++        return 2;
++    }
++    auto *w = reinterpret_cast<uint32_t *>(W);
++    // import stub at +0: udf; mov pc, lr; .word nid
++    w[0] = NATIVE_IMPORT_UDF;
++    w[1] = 0xe1a0f00e;
++    w[2] = 0x1234;
++    // halt (return_pc) at +0x100, Thumb udf
++    *reinterpret_cast<uint16_t *>(W + 0x100) = NATIVE_HALT_UDF_THUMB;
++    // function at +0x200: r0 += r1; call the stub; return
++    w[0x200 / 4 + 0] = 0xe0800001; // add r0, r0, r1
++    w[0x200 / 4 + 1] = 0xe92d4000; // push {lr}
++    w[0x200 / 4 + 2] = 0xebffff7c; // bl W+0
++    w[0x200 / 4 + 3] = 0xe8bd4000; // pop {lr}
++    w[0x200 / 4 + 4] = 0xe12fff1e; // bx lr
++    __builtin___clear_cache(reinterpret_cast<char *>(W), reinterpret_cast<char *>(W + 0x1000));
++
++    MemState mem;
++    NativeCPU cpu(mem, 1, 0);
++    set_current_cpu_state(&cpu); // the signal handler finds the CPU through this
++    FakeBoundary b;
++    b.cpu = &cpu;
++    cpu.return_pc = (W + 0x100) | 1;
++    cpu.set_sp(W + 0xF000);
++    cpu.set_reg(0, 2);
++    cpu.set_reg(1, 3);
++    cpu.set_lr(cpu.return_pc);
++    cpu.set_pc(W + 0x200);
++
++    const auto r = cpu.execute(b, false);
++    const bool ok = r && *r == 50 && b.imports == 1 && b.last_nid == 0x1234;
++    std::printf("%s: r0=%d imports=%d nid=0x%x\n", ok ? "PASS" : "FAIL", r ? static_cast<int>(*r) : -1, b.imports, b.last_nid);
++    return ok ? 0 : 1;
++}
++#else
++int main() { return 0; }
++#endif
+diff -ruN a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
+--- a/vita3k/kernel/src/kernel.cpp	2026-11-03 02:23:16.112647432 +0000
++++ b/vita3k/kernel/src/kernel.cpp	2026-11-03 02:23:38.943316374 +0000
+@@ -103,8 +103,13 @@
+     // Generate halt instruction (NOP + WFI)
+     halt_instruction = alloc_block(mem, 4, "halt_instruction");
+     const auto halt_ptr = halt_instruction.get_ptr<uint16_t>().get(mem);
++#ifdef VITA3K_NATIVE_CPU
++    halt_ptr[0] = 0xDE00; // udf #0: NativeCPU treats a trap at return_pc as "the function returned"
++    halt_ptr[1] = 0xDE00;
++#else
+     halt_ptr[0] = 0xBF00; // NOP
+     halt_ptr[1] = 0xBF30; // WFI
++#endif
+ 
+     return true;
+ }
+diff -ruN a/vita3k/kernel/src/load_self.cpp b/vita3k/kernel/src/load_self.cpp
+--- a/vita3k/kernel/src/load_self.cpp	2026-11-03 02:23:16.112620443 +0000
++++ b/vita3k/kernel/src/load_self.cpp	2026-11-03 02:23:38.943280259 +0000
+@@ -145,7 +145,11 @@
+ 
+         kernel.func_binding_infos.emplace(nid, FuncBindingInfo{ entry.address(), library_nid });
+         if (!func_address) {
++#ifdef VITA3K_NATIVE_CPU
++            stub[0] = 0xe7f000f0; // udf #0 - a real svc would be a Linux syscall. NativeCPU traps it.
++#else
+             stub[0] = 0xef000000; // svc #0 - Call our interrupt hook.
++#endif
+             stub[1] = 0xe1a0f00e; // mov pc, lr - Return to the caller.
+             stub[2] = nid; // Our interrupt hook will read this.
+         } else {
+@@ -330,7 +334,11 @@
+             if (it->second.library_nid != library_nid && !stub_targets(stub, unloaded_address))
+                 continue;
+ 
++#ifdef VITA3K_NATIVE_CPU
++            stub[0] = 0xe7f000f0; // udf #0 - a real svc would be a Linux syscall. NativeCPU traps it.
++#else
+             stub[0] = 0xef000000; // svc #0 - Call our interrupt hook.
++#endif
+             stub[1] = 0xe1a0f00e; // mov pc, lr - Return to the caller.
+             stub[2] = nid; // Our interrupt hook will read this.
+             kernel.invalidate_jit_cache(entry, 3 * sizeof(uint32_t));
+diff -ruN a/vita3k/mem/src/mem.cpp b/vita3k/mem/src/mem.cpp
+--- a/vita3k/mem/src/mem.cpp	2026-11-03 02:23:16.113068847 +0000
++++ b/vita3k/mem/src/mem.cpp	2026-11-03 02:23:38.943742580 +0000
+@@ -629,6 +629,11 @@
+     const bool is_executing = (exception_class == 0b100000) || (exception_class == 0b100001);
+     const bool is_data_abort = (exception_class == 0b100100) || (exception_class == 0b100101);
+     const bool is_writing = is_data_abort && (esr & (1 << 6));
++#elif defined(__arm__)
++    // 32-bit ARM host (native CPU backend). NativeCPU installs its own handler for guest faults,
++    // this one only has to compile. VERIFY the WnR bit (see native_cpu.cpp).
++    const bool is_executing = false;
++    const bool is_writing = context->uc_mcontext.error_code & (1u << 6);
+ #else
+ #ifdef __APPLE__
+     const uint64_t err = context->uc_mcontext->__es.__err;

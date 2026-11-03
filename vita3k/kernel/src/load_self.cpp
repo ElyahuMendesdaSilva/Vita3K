@@ -145,7 +145,11 @@ static bool load_func_imports(const uint32_t *nids, const Ptr<uint32_t> *entries
 
         kernel.func_binding_infos.emplace(nid, FuncBindingInfo{ entry.address(), library_nid });
         if (!func_address) {
+#ifdef VITA3K_NATIVE_CPU
+            stub[0] = 0xe7f000f0; // udf #0 - a real svc would be a Linux syscall. NativeCPU traps it.
+#else
             stub[0] = 0xef000000; // svc #0 - Call our interrupt hook.
+#endif
             stub[1] = 0xe1a0f00e; // mov pc, lr - Return to the caller.
             stub[2] = nid; // Our interrupt hook will read this.
         } else {
@@ -330,7 +334,11 @@ static bool unload_func_exports(const uint32_t *nids, const Ptr<uint32_t> *entri
             if (it->second.library_nid != library_nid && !stub_targets(stub, unloaded_address))
                 continue;
 
+#ifdef VITA3K_NATIVE_CPU
+            stub[0] = 0xe7f000f0; // udf #0 - a real svc would be a Linux syscall. NativeCPU traps it.
+#else
             stub[0] = 0xef000000; // svc #0 - Call our interrupt hook.
+#endif
             stub[1] = 0xe1a0f00e; // mov pc, lr - Return to the caller.
             stub[2] = nid; // Our interrupt hook will read this.
             kernel.invalidate_jit_cache(entry, 3 * sizeof(uint32_t));

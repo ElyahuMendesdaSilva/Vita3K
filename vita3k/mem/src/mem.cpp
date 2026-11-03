@@ -629,6 +629,11 @@ static void signal_handler(int sig, siginfo_t *info, void *uct) noexcept {
     const bool is_executing = (exception_class == 0b100000) || (exception_class == 0b100001);
     const bool is_data_abort = (exception_class == 0b100100) || (exception_class == 0b100101);
     const bool is_writing = is_data_abort && (esr & (1 << 6));
+#elif defined(__arm__)
+    // 32-bit ARM host (native CPU backend). NativeCPU installs its own handler for guest faults,
+    // this one only has to compile. VERIFY the WnR bit (see native_cpu.cpp).
+    const bool is_executing = false;
+    const bool is_writing = context->uc_mcontext.error_code & (1u << 6);
 #else
 #ifdef __APPLE__
     const uint64_t err = context->uc_mcontext->__es.__err;

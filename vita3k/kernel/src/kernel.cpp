@@ -103,8 +103,13 @@ bool KernelState::init(MemState &mem, const CallImportFunc &call_import, bool cp
     // Generate halt instruction (NOP + WFI)
     halt_instruction = alloc_block(mem, 4, "halt_instruction");
     const auto halt_ptr = halt_instruction.get_ptr<uint16_t>().get(mem);
+#ifdef VITA3K_NATIVE_CPU
+    halt_ptr[0] = 0xDE00; // udf #0: NativeCPU treats a trap at return_pc as "the function returned"
+    halt_ptr[1] = 0xDE00;
+#else
     halt_ptr[0] = 0xBF00; // NOP
     halt_ptr[1] = 0xBF30; // WFI
+#endif
 
     return true;
 }

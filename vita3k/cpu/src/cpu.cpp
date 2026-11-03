@@ -16,7 +16,11 @@
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 #include <cpu/disasm/functions.h>
+#ifdef VITA3K_NATIVE_CPU
+#include <cpu/impl/native_cpu.h>
+#else
 #include <cpu/impl/dynarmic_cpu.h>
+#endif
 #include <cpu/state.h>
 #include <mem/ptr.h>
 #include <util/types.h>
@@ -31,7 +35,11 @@ CPUState::CPUState(MemState &mem, SceUID thread_id, std::size_t processor_id)
     , processor_id(processor_id) {}
 
 CPUStatePtr init_cpu(bool cpu_opt, SceUID thread_id, std::size_t processor_id, MemState &mem) {
+#ifdef VITA3K_NATIVE_CPU
+    CPUStatePtr cpu = std::make_unique<NativeCPU>(mem, thread_id, processor_id);
+#else
     CPUStatePtr cpu = std::make_unique<DynarmicCPU>(mem, thread_id, processor_id, cpu_opt);
+#endif
     if (!init(cpu->disasm))
         return nullptr;
     return cpu;
